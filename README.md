@@ -4,8 +4,9 @@
 > 完整走通 UniXNU 的 `format 2` 构建链：自编 clang → 拉源码 → 编 XNU → 编 UEFI 固件 →
 > 生成 ADT payload → 打包可启动镜像 → `fastboot boot` 上机。
 >
-> 最终固件在真机上跑到 **阶段 10 / 12（CasStageKeys）**，全程零报错。
-> 期间定位并修复了上游两个从未在真机上暴露过的 bug。
+> 最终 XNU 内核在真机上执行到 **BSD init 的根设备挂载**：
+> `Failed to mount root device @IOKitBSDInit.cpp:984`。
+> 期间定位并修复了上游两个从未在真机上暴露过的 bug，并把 PMGR 桥接移植到了 Linux 工具链。
 >
 > 这份文档把踩过的坑全部写下来，后来的人不用再白跑一遍。
 
@@ -14,13 +15,21 @@
 ## 0. 结果速览
 
 ```
-阶段条：1-10 全绿，无 fault，画面静止
-阶段 11 (Bds) / 12 (Application) 未到达
-含义：DXE 驱动派发未完成 —— 某个驱动初始化后没有返回
+UniXNU 菜单 ✅ → DarwinBoot 绿条 ✅ → ExitBootServices ✅
+→ XNU 早期初始化 ✅ → AMFI 早期安全 ✅（PMGR 桥接）
+→ bsd_init ✅ → IOFindBSDRoot ✅ → 根设备挂载失败 ⚠️
+
+屏幕最终输出：
+Failed to mount root device @IOKitBSDInit.cpp:984
+frames fffffff00700797c35ed fffffff0078e48e0 ...
+pages=0x00000000127192   free=0x00000000126957
 ```
 
-`CasDisplayMark()` 会按颜色点亮阶段格，第 10 格之后卡住说明卡在 DXE 阶段，
-不是 SEC / 内存 / 显示的问题。这两个我们已经跨过了。
+这不是崩溃，是**内核完整启动到了挂载根文件系统**这一步——存储驱动还没做，
+所以找不到根设备。与 `fuxi-oddlylabs.toml` 记录的预测结果一字不差。
+
+> ⚠️ 途中一度以为「卡在阶段 7 / 10」。**阶段条不可信**：`CasDisplayRefresh()`
+> 会把 `Stopped` 置位并永久停止刷新（见 §3.13）。真机画面才可信。
 
 ---
 
@@ -474,63 +483,121 @@ FD 在 `uefi-cas/Build/casUpstream001/DEBUG_CLANGPDB/FV/`，**不在 `UniXNU/out
 
 ---
 
+### 3.13 ⚠️ 阶段条会自己停掉 —— 本次最大的误导
+
+`CasDisplayRefresh()` 在 `Library/CasDisplayLib/DisplayHardware.c`：
+
+```c
+if (Read (B + 0xf4) != State->Snapshot.Ctls[I].IntfActive ||
+    Read (B + 0x14) != State->Snapshot.Ctls[I].Top) {
+  ++State->RefreshErrors; State->Stopped = 1; return;
+}
+```
+
+GOP 接管时 CTL 配置会被改写，于是 `Stopped` 被置位；而 `CasDisplayMark()`
+的守卫里有 `S->Stopped`，此后**所有阶段标记静默丢弃**。结果就是：
+
+> 条子停在 7（或 10），画面不动，而系统其实早就跑到 UniXNU 菜单甚至内核了。
+
+**修法**（两处，均已验证）：
+
+```c
+// 刷新失败只计数、不放弃
+++State->RefreshErrors; continue;
+// CasDisplayMark 守卫里去掉 S->Stopped
+if (S->Magic != CAS_DISPLAY_MAGIC || !S->Ready || Stage == 0 || ...) { return; }
+```
+
+**教训**：阶段条只是辅助，真机画面才是唯一可信的信号。
+另外 12 个格子里**每格都会画十六进制编号（1..C）**，只能看颜色，不能看数字。
+
+### 3.14 ⚠️ 把 macOS 的 PMGR 桥接脚本移植到 Linux
+
+`XNU` 在 AArch64 高通平台上会 panic 在 `AMFI: No PMGR?`，需要一个
+provider 为 NULL 的 `ApplePMGRNub`。参考 `UniXNU-sheng@08cde20` 的
+`ShengPlatformPower.cpp` 与 `OddlyLabs/UniXNU-fuxi` 的构建脚本，两处需要适配：
+
+**(a) `xcrun` 是 macOS 专属。**
+
+- 汇编文件（`original-bindings.S`）只有 `.globl` / `.set`，不需要 SDK：
+  直接用编译记录 `IOPlatformExpert.cpo.json` 里的
+  `/opt/unixnu-linux/llvm/bin/clang-24 --target=arm64-apple-ios17.0 -c`
+- `xcrun ar rcs` → `/usr/bin/llvm-ar rcs`
+
+**(b) WSL 的 `llvm-objcopy` 18 不支持 Mach-O。**
+
+```
+/usr/bin/llvm-objcopy: error: option is not supported for MachO
+  --remove-section=__DATA,__mod_init_func
+  --globalize-symbol=__GLOBAL__sub_I_ShengPlatformPower.cpp
+```
+
+用纯 Python 改目标文件即可：把 `__DATA,__mod_init_func` 的段描述符
+（`LC_SEGMENT_64` 里 80 字节一节）`size` / `offset` / `reloff` / `nreloc` 四个字段归零，
+链接器就不会收集 C++ 全局构造器。文件长度不变，`__text` 不变，脚本后面的
+`text_section(raw) == text_section(late)` 自检照样过。
+
+`__GLOBAL__sub_I_*` 保持局部符号即可——`sheng_pmgr_run()` 对它的调用通过
+目标文件内的重定位直接指向该符号，不需要 globalize。
+
+完整脚本：`cas-full/scripts/build-cas-platform-power.py`。
+
+---
+
 ## 4. 现状与下一步
 
 ### 4.1 已经跨过的阶段
 
 ```
-1 ShimValidated  ✅
-2 FdCopied       ✅
-3 FdtCopied      ✅
-4 Sec            ✅  ← 修完上面两个 bug 后才过
-5 Mmu            ✅
-6 Hobs           ✅
-7 Decompressed   ✅
-8 Dxe            ✅
-9 Gop            ✅
-10 Keys          ✅  ← 当前
-11 Bds           ⬜
-12 Application   ⬜   DarwinBoot
+1 ShimValidated  ✅   7 Decompressed ✅
+2 FdCopied       ✅   8 Dxe ✅
+3 FdtCopied      ✅   9 Gop ✅
+4 Sec            ✅  10 Keys ✅
+5 Mmu            ✅  11 Bds ✅  UniXNU 菜单
+6 Hobs           ✅  12 Application ✅  DarwinBoot 绿条 → XNU
 ```
 
-### 4.2 卡点分析
+### 4.2 两个曾经被误判的「卡点」
 
-停在 `Keys` 之后、`Bds` 之前，且**无 fault 条**，说明：
+排查过程中有两轮被自己的仪表骗了，记录下来免得后来者重蹈覆辙：
 
-- 不是异常（异常会 `CasDisplayFault(Esr)`）
-- 不是某个 `Stop(Status)`
-- 而是**某个 DXE 驱动 EntryPoint 没有返回** —— BDS 要等所有驱动派发完才启动
+1. **「卡在第 7 / 10 格」**：`CasDisplayRefresh()` 一旦发现 CTL 配置被 GOP 改过，
+   就置 `Stopped = 1` 并永久停止刷新，之后所有阶段标记静默丢弃。
+   系统其实早就跑到菜单甚至内核了。**真机画面才是唯一可信的信号。**
+   修法见 §3.13。
+2. **「阶段条竖向排列」**：那是拍照时手机横着拿，不是 framebuffer 方向错误。
+   竖屏照片里它就是横排在最底部的，完全正常。
 
-`DXE.upstream.inc` 里 Keys 之后还有：
+另外，「卡第 7 格」还**会偶发**：同一个镜像第一次卡、第二次直接进内核。
+单次现象不能当结论。
+
+### 4.3 已经修掉的 AMFI 关卡
+
+XNU 起初 panic 在
 
 ```
-GraphicsConsoleDxe、UniXNUPkg/Application/UniXNU、
-UniXNUDxe、UniXNURamDiskDxe、DiskIoDxe、EnglishDxe、Fat、DarwinBootPkg
+"AMFI: No PMGR?\n" @ConfigurationSettings.cpp:235
 ```
 
-已排除：
+高通平台没有 Apple PMGR。试过注释 prelink 的 `early_security_init`，**无效**——
+触发点在 AMFI kext 自己的 `ConfigurationSettings`。
 
-- `CasKeysDxe` 明确 `return EFI_SUCCESS`
-- `UniXNURamDiskDxe` 内无 `while` / `for(;;)` / `Stall`
+正确解法（与 `fuxi-oddlylabs.toml` 一致）：发布一个 provider 为 NULL 的
+`ApplePMGRNub`。完整做法见 §3.14 和 `NEXT.md`。修完后屏幕变成：
 
-最可疑：**`DarwinBoot.inf`**（整条链里唯一从未在这台机器上跑过的组件）
-和 **`GraphicsConsoleDxe`**（GOP 模式异常时可能死循环）。
+```
+Failed to mount root device @IOKitBSDInit.cpp:984
+```
 
-### 4.3 明天的定位手法
+### 4.4 下一步：根设备挂载
 
-每次循环约 1 分钟（编固件 20 秒 + 打包 5 秒 + 刷入 3 秒 + 重启 30 秒）：
+`cas.toml` 的 `storage` 区域状态仍是 `planned`。`board.toml [userdata]` 指向
+LUN0（sda34）LBA `0x2c0000`–`0x3b4b7fa`、4 KiB 块，那才是 iOS 根卷所在。
 
-1. 注释掉 `DXE.upstream.inc` 里的 `DarwinBoot.inf` → 能进第 11 格就是它
-2. 不行就注释 `GraphicsConsoleDxe.inf` → 排除显示栈
-3. 都不行就二分砍驱动清单
+- 要么接上 UFS / NativeUfs 驱动，从真机 userdata 挂根
+- 要么先用 mockfs / ramdisk 挂一个最小根，验证 `bsd_init` 之后的用户态路径
 
-更彻底的做法：给每个 `INF` 前后插入不同的 `CasDisplayMark` 阶段号，
-一次就能定位（阶段号只有 1-12，需要临时扩展枚举）。
-
-### 4.4 已知但不阻塞的问题
-
-- **阶段条竖向排列**（应横向排在最底部）→ framebuffer 的宽高 / stride 方向不对，
-  说明 GOP 拿到的模式信息有误。不影响启动，等跑通再修。
+这一步开始就是「让 Darwin 真正跑起来」的活了，不再是启动链的问题。
 
 ---
 
