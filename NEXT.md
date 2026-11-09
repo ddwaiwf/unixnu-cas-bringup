@@ -1,30 +1,73 @@
-# 进度与续接（2026-11-10 01:35）
+# 进度与续接（2026-11-10 02:00）
 
-> 明天开机从这里接着干。下面每一条都是可执行的。
+> 明天开机从这里接着干。
 
 ## 一句话状态
 
-固件在真机上跑到 **阶段 10 / 12（`CasStageKeys`）**，零报错、画面静止。
-卡在 **DXE 驱动派发未完成**——某个驱动的 `EntryPoint` 没有返回，BDS 因此永远不会启动。
+**内核在真机上跑起来了。** UniXNU 菜单 → DarwinBoot 绿条 → ExitBootServices → XNU 执行 →
+panic 在 `AMFI: No PMGR?`（`ConfigurationSettings.cpp:235`）。
 
 ```
-1 ShimValidated ✅   5 Mmu ✅          9 Gop ✅
-2 FdCopied      ✅   6 Hobs ✅        10 Keys ✅  ← 当前
-3 FdtCopied     ✅   7 Decompressed ✅ 11 Bds ⬜
-4 Sec           ✅   8 Dxe ✅         12 Application ⬜
+空目录 → 自编 clang → XNU 内核 48.6 MB → 8 MiB 固件 → 64 MiB payload → boot.img
+→ UniXNU 菜单 ✅ → DarwinBoot 交接 ✅ → XNU 早期初始化 ✅ → AMFI panic ⚠️
 ```
+
+屏幕上那行 `pages=0x12719a  free=0x12619f` 是 XNU 内存管理器的统计，只有内核真的跑到那一步才会打印。
+
+## 明天第一件事：绕过 AMFI 的 PMGR 检查
+
+### 已经试过、确认无效的路
+
+注释掉 `profiles/os/ipados-17.7.11-21H461/profile.toml` 里的
+
+```toml
+"early_security_init" = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
+```
+
+重新 prelink 后（日志里 `early-security` 出现 0 次，payload 内核哈希变成 `75cbe103…`），
+panic **一模一样**。说明触发点在 **AMFI kext 自己的 ConfigurationSettings**，不是 prelink 的早期调用。
+
+> 该行目前仍是注释状态，原文件备份在 `profile.toml.bak-amfi`。要恢复把注释去掉即可。
+
+### 正确的路：造一个 provider 为 NULL 的 ApplePMGRNub
+
+UniXNU 文档（sirius 移植记录）写得很清楚：
+
+> AMFI is cleared without touching the target kernel: the nub helpers behind AMFI's
+> readAon/writeAon return 0 when the provider stored at nub+0x88 is NULL, so publishing a
+> real but provider-less ApplePMGRNub satisfies the latch (read 0, OR 4, write no-op).
+> ... registers it from the `sheng_pmgr_run` hook in bsd_init
+> (`CONFIG_XNU_SHENG_PMGR=1`, `sheng-pmgr=2`)
+
+需要的四件东西：
+
+1. `CONFIG_XNU_SHENG_PMGR=1`（`cas_defconfig` 里加）
+2. boot arg `sheng-pmgr=2`（`board.toml [payload] kernel_args` 里加）
+3. `sheng-platform-power.patch`（**已在补丁序列里**，今晚加的）
+4. **ShengPlatformPower 的实现 + 构建脚本** ← **目前缺这个**
+
+`cas-full/package/` 下现在只有 `armcpu/` 和 `Kit.toml`，没有平台电源的实现。
+可以从别的移植抄：`sirius`（`package/SiriusPmgr.cpp`）或 `fuxi`
+（`package/ShengPlatformPower.cpp` + `scripts/build-fuxi-platform-power.py`），然后：
+
+- 实现放 `cas-full/package/platform-power/`
+- 构建脚本写 `cas-full/scripts/build-platform-power.py`，产物落到
+  `build/sheng-platform-power/libShengPlatformPower.a`
+  （`build-xnu-4k-baseline.sh` 会强制加载这个路径）
+- `board.toml` 的 `archives` 里加上这个脚本
 
 ## 已有产物（都在，不用重编）
 
 | 文件 | 说明 |
 |---|---|
-| `WSL:~/unixnu/src/UniXNU/out/cas/.../kernel/kernel.macho` | 48.6 MB，30 组件 / 69294 绑定 |
-| `WSL:~/unixnu/src/uefi-cas/Build/casUpstream001/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd` | 8 MiB，含两处修复 |
+| `WSL:.../cas/kernel/kernel.macho` | 48.6 MB，已去掉 AMFI 早期初始化 |
+| `WSL:.../uefi-cas/Build/casUpstream001/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd` | 8 MiB |
 | `WSL:.../cas/payload/payload.img` | 64 MiB FAT32 |
 | `D:\unixnu\dump\extract\boot-dtb-initrd.bin` | 478,636 字节，含 `linux,initrd-*` |
-| `D:\unixnu\out\cas-darwinboot-v3.img` | 67,887,104 字节，sha256 `677643b5…`，当前上机版本 |
+| `D:\unixnu\out\cas-darwinboot-v6.img` | 67,887,104 字节，**能进内核的那版** |
+| `D:\unixnu\out\cas-darwinboot-v5.img` | 旧内核，同样能进内核（用于对照） |
 
-重新打包镜像（不需要 WSL，Windows 上直接跑）：
+重新打包镜像（Windows 上直接跑，不用进 WSL）：
 
 ```bash
 cd /d/unixnu && python tools/pack_boot.py \
@@ -32,63 +75,44 @@ cd /d/unixnu && python tools/pack_boot.py \
   --shim release/ex/firmware/shim/shim.bin \
   --fd "//wsl.localhost/Ubuntu-24.04/home/ddw/unixnu/src/uefi-cas/Build/casUpstream001/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd" \
   --ramdisk "//wsl.localhost/Ubuntu-24.04/home/ddw/unixnu/src/UniXNU/out/cas/ipados-17.7.11-21H461/cas/payload/payload.img" \
-  --out out/cas-darwinboot-v4.img
+  --out out/cas-darwinboot-v7.img
 ```
 
-## 明天的第一步：定位卡住的驱动
-
-每轮约 1 分钟（编固件 20s + 打包 5s + 刷入 3s + 重启 30s）。
-
-**实验 1** — 注释掉 `DarwinBoot.inf`，看能否进第 11 格：
+## 刷机流程
 
 ```bash
-# 文件：~/unixnu/src/uefi-cas/Platforms/Xiaomi/casPkg/Include/DXE.upstream.inc 第 28 行
-#   INF DarwinBootPkg/Driver/DarwinBoot.inf      ← 前面加 #
-wsl -d Ubuntu-24.04 -- bash /mnt/d/unixnu/wsl-build.sh fw
-```
-
-**实验 2** — 不行再注释 `GraphicsConsoleDxe.inf`（第 21 行），排除显示栈。
-
-**实验 3** — 都不行就二分砍 `DXE.upstream.inc` 的驱动清单。
-
-**更彻底**（推荐，一次定位）：给每个 `INF` 前后插入不同的 `CasDisplayMark` 阶段号。
-需要临时扩展 `CasPlatform.h` 里的阶段枚举（现在只有 12 格）。
-
-已经排除的：
-- `CasKeysDxe` 明确 `return EFI_SUCCESS`
-- `UniXNURamDiskDxe` 里没有 `while` / `for(;;)` / `Stall`
-
-## 刷机流程（当前设备状态）
-
-```bash
-# 1. 设备卡死时先长按电源 12 秒断电
-# 2. 音量下 + 电源 进 fastboot
+# 设备卡死时先长按电源 12 秒断电，然后 音量下 + 电源 进 fastboot
 cd /d/unixnu/tools/platform-tools
 export MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
 ./fastboot.exe devices
-./fastboot.exe boot "D:/unixnu/out/cas-darwinboot-v4.img"
+./fastboot.exe boot "D:/unixnu/out/cas-darwinboot-v7.img"
 ```
 
-`fastboot boot` 只载入内存，不写分区。想回 Android：长按电源 12 秒再正常开机。
+进菜单后按 Enter（或等 10 秒倒计时）引导。
+`fastboot boot` 不写分区，长按电源 12 秒可回 Android。
 
-## 遗留问题（不阻塞）
+## 重要教训（今天踩的）
 
-- **阶段条竖向排列**：应该横向排在最底部，现在竖着贴在左边缘 →
-  framebuffer 的宽高 / stride 方向不对，GOP 拿到的模式信息有误。
-  等 DXE 跑通再修，修好在 `CasGopDxe.c` / `DisplayHardware.c`。
+### 1. 别信阶段条
 
-## 注意
+`CasDisplayRefresh()` 一旦发现 CTL 配置被 GOP 改过，就置 `Stopped=1` 并永久停止刷新，
+之后所有阶段标记静默丢弃。这让我们误判了两轮——「卡在第 7 格」其实系统早就跑到菜单了。
 
-- 设备屏幕**没有串口**，唯一的调试手段就是阶段条 + 故障码（见 README §5）。
-- `fastboot` 和 `adb` 都能直接在本机跑，`wsl.exe` 在沙箱黑名单里，WSL 命令必须手敲。
-- 修改 `casPkg` 后要**两侧同步**（`D:\unixnu\src\uefi-cas` 和 WSL 的 `~/unixnu/src/uefi-cas`），
-  D 盘那份是源头，WSL 那份是编译用的。
+已修（`DisplayHardware.c`）：
 
-## 已修的上游 bug
+- 刷新失败只累加 `RefreshErrors` 然后 `continue`，不再置 `Stopped`
+- `CasDisplayMark` 的守卫里去掉了 `S->Stopped`
 
-两个，都写在 `issues/` 下，可以直接提给 `ht94911/uefi-cas`：
+### 2. 单次现象不能当结论
 
-- `issues/0001-sec-shared-initrd-called-before-copy.md`
-- `issues/0002-dtb-chosen-missing-initrd-properties.md`
+v6 第一次启动卡在第 7 格，第二次直接进了内核。**同镜像、同设备、不同结果。**
 
-**这两个必须同时修**，只修一个仍然卡在同一阶段——这是最容易浪费时间的点。
+### 3. 阶段条怎么读
+
+12 个格子，青色 `0x16a070` = 已到达，深蓝 `0x303540` = 未到达。
+**每格都会画十六进制编号（1..C）**，所以只能看**颜色**，不能看数字。
+
+## 遗留
+
+- DXE 阶段的偶发卡顿（第 7 格）仍存在，未定位。
+- 存储 / 显示 / 输入驱动都没做，AMFI 过了之后还有很长的路。
