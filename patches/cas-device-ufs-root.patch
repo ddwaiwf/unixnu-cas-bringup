@@ -1,0 +1,61 @@
+diff --git a/board.toml b/board.toml
+index 048deb9..c293167 100644
+--- a/board.toml
++++ b/board.toml
+@@ -18,7 +18,7 @@ config_fragments = ["arch:configs/common.config", "soc:configs/sm8250.config", "
+ patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+ # cas-armcpu-asm-fix.py must run before component:ArmCpu: it stages ArmCpu with the
+ # Darwin assembler separator fix that upstream ArmCpu 9066b53 still lacks.
+-archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "cas-armcpu-asm-fix.py", "component:ArmCpu", "component:SoftwareAES", "build-software-aes-bindings.py", "build-mockfs-fixture.py", "build-libpthread-kernel.py"]
++archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "cas-armcpu-asm-fix.py", "component:ArmCpu", "component:SoftwareAES", "build-software-aes-bindings.py", "component:ShengUfs", "build-virtio-mmio-bindings.py --component NativeUfs --directory build/sheng-ufs", "component:VirtioMmioBlock", "build-virtio-mmio-bindings.py --component NativeVirtioBlock --directory build/virtio-mmio-block", "build-mockfs-fixture.py", "build-libpthread-kernel.py", "build-cas-platform-power.py", "build-boot-progress.py"]
+ 
+ [device_tree]
+ source = "device:dts/cas.dts"
+@@ -50,7 +50,7 @@ loader = "firmware"
+ title = "cas iPadOS 17"
+ timeout = 3
+ panic_screen = true
+-kernel_args = ["-v", "keepsyms=1", "debug=0x14e", "kt_fixed_zones=120"]
++kernel_args = ["-v", "keepsyms=1", "debug=0x14e", "kt_fixed_zones=120", "sheng-pmgr=2"]
+ 
+ [payload.adt]
+ chip_id = "8011"
+diff --git a/configs/cas_defconfig b/configs/cas_defconfig
+index 8fab5b6..7182881 100644
+--- a/configs/cas_defconfig
++++ b/configs/cas_defconfig
+@@ -10,11 +10,28 @@ CONFIG_XNU_NATIVE_PAN=y
+ CONFIG_XNU_DT_PANIC_REGION=y
+ CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+ CONFIG_XNU_SOURCE_MOCKFS=y
++CONFIG_XNU_SHENG_PMGR=y
+ CONFIG_XNU_TRUST_CACHE_RUNTIME=y
+-# CONFIG_XNU_NATIVE_UFS is not set
+-# CONFIG_XNU_NATIVE_ADRENO is not set
+-# CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
+-# CONFIG_XNU_NATIVE_RAM_BLOCK_STORE is not set
+ 
+-# Successful observations log and continue; optional GUI/storage experiments remain off.
+-CONFIG_XNU_BOOT_PROGRESS=n
++# ---- UFS real root (2026-11-10 night) ----
++# NOTE: `# CONFIG_X is not set` lines are LIVE (config.py last-wins). None of the
++# switches below may have a same-named `is not set` marker AFTER their `=y`.
++# Owner-verified root publication. Without this ShengUfs compiles probe-only
++# (-DNATIVE_UFS_PROBE_ONLY=1) and publishes no IOMedia, so IOFindBSDRoot times out.
++CONFIG_XNU_VERIFIED_ROOT_PROBE=y
++CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a"
++# Root authentication: bsd_init FSIOC_KERNEL_ROOTAUTH path. APFS needs SEP which
++# SM8250 has not, so OWNER_ROOT_AUDIT/TRUST is the only way past the panic.
++CONFIG_XNU_OWNER_ROOT_AUDIT=y
++CONFIG_XNU_OWNER_ROOT_TRUST=y
++# UFS transport (SM8250 fork). Reads the userdata OS/SystemOS windows.
++CONFIG_XNU_NATIVE_UFS=y
++# VirtioMmioBlock is linked as an AUTHENTICATION library (no virtio,mmio node in
++# the DTS, so it never probes): it defines native_verified_block_root_authorized()
++# which the offline-owner patches call, and reaches ShengUfs via the weak
++# native_ufs_block_authenticates(). The verified bundle adds MULTI_POLICY.
++CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
++CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/virtio-mmio-block-verified-bundle/libVirtioMmioBlock.a"
++# Optional GUI/storage experiments remain off.
++# CONFIG_XNU_NATIVE_ADRENO is not set
++CONFIG_XNU_BOOT_PROGRESS=y
