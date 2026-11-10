@@ -690,4 +690,128 @@ $b = (Get-NetAdapterStatistics | ? Name -eq "以太网 2").ReceivedBytes
 
 ---
 
+## 9. 2026-11-10：换 Mac 原生构建，真机第一次跑起用户态进程（PID 1）
+
+第二天把整条链搬到 **Mac（Apple Silicon, macOS 27.2）** 重建，全部原生（无 WSL），
+当天达成 **AMFI 验签 → mockfs RAM 根 → /sbin/launchd 被 exec → PID 1 正常运行退出**。
+本文档 §1–8 记录的是 Windows/WSL 首日；本节是 Mac 接续日，两条路径现已都能出可上机镜像。
+
+### 9.1 Mac 工具链（复现清单）
+
+```bash
+brew install cmake ninja unifdef llvm lld mtools dtc lzfse   # 清华 bottle 镜像加速
+# 完整 Xcode（App Store），许可同意后 iphoneos SDK 可用——kernel 步骤硬依赖
+curl -LO https://dl.google.com/android/repository/platform-tools-latest-darwin.zip  # fastboot/adb
+```
+
+克隆四仓：`UniXNU`（主仓+子模块）、`UniXNU-cas`、`uefi-cas`（main 分支）、
+`UniXNU-sm8250-common`，另加参考仓 `UniXNU-sheng` / `UniXNU-alioth`。
+
+**Mac 特有坑：**
+1. WorkBuddy 等工具注入的 `PYTHONPATH` 会把 `mkdir(exist_ok=True)` 拦成 EEXIST
+   → 跑 `./unixnu` 前 `export PYTHONPATH=`。
+2. `prepare-xnu-source.py` 调 GitHub API（DriverKit/TrustCache 列表），共享代理出口 IP
+   撞匿名限流 → **直连**预置三份缓存 JSON 到 `tree/.cache/sources/`。
+3. SafeDelete 类文件策略会咬 XNU Makefile（sysent 重建 >50 文件）→ 内核构建在可信环境跑。
+
+### 9.2 ⚠️ 最重要的一个坑：`PcdDebugPropertyMask` 必须 `0x0F`（Windows 端改了没写进来）
+
+`cas-upstream.dsc` 上游值 `0x2F` 含 `ASSERT_BREAKPOINT|ASSERT_DEADLOOP` 位：
+**任何驱动一旦 ASSERT()，直接 CpuBreakpoint → 异常 → 死循环，屏幕阶段条永远冻结**，
+且没有任何文字输出。首日 Mac 构建的镜像三次上机全部冻在第 10 格（Keys）就是它。
+Windows 端第一天就手改成了 `0x0F`（ASSERT 打印后继续），但没记录。
+
+```diff
+-  gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x2F
++  gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x0F
+```
+
+**教训：跨机器接续时，先把上一台机器「改了但没写进文档」的配置 diff 一遍**
+（对照 `.bak-*` 备份文件），再谈重建。
+
+### 9.3 ⚠️ 第二个坑：根设备参数名是 `rd=` 不是 `root=`
+
+XNU 的 `IOKitBSDInit.cpp:781` 解析的是 `rd=` / `rootdev=`。写 `root=md0` 会被静默忽略。
+mockfs RAM 根的正确写法：`rd=md0`。
+
+### 9.4 mockfs RAM 根 —— 完整接线（今天打通）
+
+XNU 的 `miscfs/mockfs`（`CONFIG_XNU_SOURCE_MOCKFS=y` + `-DMOCKFS=1` 编进内核）
+提供一个最小可执行根：设备内容是一个 `N4KROOT` 容器，内含
+`/sbin/launchd`（签名静态 Mach-O）和 `/probe.bin`。内核把它 exec 成 PID 1。
+
+接线五件套（全部由 `./unixnu payload/bootimg` 自动组装）：
+
+1. **fixture**：`scripts/build-native-user-fixture.py` 编译静态 arm64 iOS17 进程，
+   ad-hoc 签名，产出 `launchd.macho` + `trustcache.bundle`（cdhash 信任模块）。
+2. **根镜像**：按 `<8sII4Q` 头打包 `N4KROOT\0 + version=1 + count=2 +
+   launchd@4096 + probe.bin`（约 45 KB）。
+3. **payload**：`--data-ramdisk root.img --trust-cache trustcache.bundle`
+   → `scratch-data.img` 进 payload FAT，ADT `/chosen/memory-map` 写入
+   `RAMDisk`/`TrustCache` 16 字节占位（`devicetree.py generate`）。
+4. **DarwinBoot**：扫描 ADT 占位 → 把 scratch-data.img 拷进 DarwinBoot 内存窗口 →
+   回填真实地址/大小。
+5. **内核**：`IOKitBSDInit` 读 memory-map RAMDisk → `mdevadd` → `/dev/md0`；
+   `rd=md0` 直接命中（跳过 Apple_HFS 设备等待）；mockfs 挂根 →
+   exec `/sbin/launchd` → AMFI 验签 → **PID 1**。
+
+信任白名单：`profiles/os/ipados-17.7.11-21H461/profile.toml` 的
+`trust_cache_sha256` 数组要加入 fixture bundle 的 sha256。
+
+### 9.5 boot-progress 仪器（卡死定位必备）
+
+`rd=md0` 之后若挂载链卡死，屏幕毫无输出。开了 `CONFIG_XNU_BOOT_PROGRESS=y`
++ archives `build-boot-progress.py` + 内核参数 `boot-progress=2` 后，**内核每过一个
+阶段就在 framebuffer 上画一行**。这套 kit 在 sheng/alioth 设备仓里
+（framework 不带），alioth 与 cas 同为 SM8250，kit 可直接复用，只需：
+
+- `boot_progress_exit` 签名对齐本框架补丁（6 参→5 参，reason 参数置 NULL）；
+- baseline 的 UFS/owner-root 门禁放宽（cas 没有 UFS，保留 corecrypto 检查）；
+- 一个桩生成器：扫包内全部 `extern`（weak_import + 普通）声明，`llvm-nm` 对已编对象
+  去重后，自动生成缺失符号的零值全局桩和 `return 0` 函数桩
+  （注意：函数桩不能写匿名参数——C23 扩展会被 `-Werror` 拒）；
+- 桩编译去掉 `-Wextra -Werror`。
+
+### 9.6 上机结果（v7：cas-mac-v7-bp.img）
+
+```
+ts: SUCCEEDED - OS and diagnostic recording continues
+ts pid=3 process signature accepted          ← AMFI 放行
+ts pid=3 load_init_program: enter → returned
+ts pid=3 1 launchd: 10000038a/0              ← PID 1 = 我们的 launchd
+process exit: total=2 nonzero=0 status=0 reason=0 dropped=0
+UFS TIME verify=0 ms read=0 ms verified=0 blocks (0 MiB) requests=0   ← 桩如实报零
+```
+
+链路：`rd=md0` → DarwinBoot 回填 RAMDisk → XNU `mdevadd` → mockfs 挂根 →
+exec `/sbin/launchd` → AMFI 验签 → **PID 1 运行并正常退出**。
+镜像 sha256 `8333135a…`（boot-progress 内核 `60b8d784…`）。
+
+### 9.7 现状与下一步
+
+§4.1 的阶段表更新：1–12 ✅ → DarwinBoot ✅ → XNU ✅ → mockfs RAM 根 ✅ → **PID 1 ✅**。
+通往桌面的剩余路径 = PORTING-PLAN 阶段 2–4：**UFS 驱动**（读 userdata 里的
+OS/SystemOS 窗口）→ 真实 iOS 根 + 真 launchd → legacy display/GPU → SpringBoard。
+
+---
+
+## 10. Mac 构建时间账
+
+| 阶段 | 耗时（Mac M 系列原生） |
+|---|---|
+| 固件（EDK2，含修复重放） | 约 20 秒 |
+| kernel（40+ 补丁 + prelink，IPSW 流式 range 拉取） | 约 1.5 分钟 |
+| payload | 数秒 |
+| bootimg 打包（含 shim 编译与回读校验） | 数秒 |
+| fixture + 根镜像 | 数秒 |
+
+**注意**：Windows 那套 `wsl-build.sh` 的 kernel 步骤产物（Linux ELF 工具链）与 Mac
+不通用，两条机器各自全量构建；payload/bootimg 层产物可以互相校验。
+
+---
+
+*§9 由 Mac 实机调试过程整理，命令在 Apple Silicon macOS 27.2 + Xcode 26/27.2 上验证过。*
+
+---
+
 *本文档由实际调试过程整理，所有命令均在 Windows 11 + WSL2 Ubuntu 24.04 上验证过。*
