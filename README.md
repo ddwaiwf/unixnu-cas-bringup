@@ -861,3 +861,32 @@ userdata 镜像由框架原生 `./unixnu userdata` 一步构建（SHNGROOT：OS 
 ---
 
 *§11 由 2026-11-10 晚 Mac 实机调试整理；fastboot 分段 sparse 生成器与设备状态机结论在小米 10 Ultra（cas）上实测有效。*
+
+---
+
+## 12. 2026-11-10 夜（Windows 端）：两个链接符号的来源定位
+
+Mac 那边 §11.5 留下的三个卡点，Windows 端把源码全拉下来逐个定位清楚了，
+解法与命令顺序见 **`UFS-ROOT-DAY2.md`**。结论：
+
+| 缺失符号 | 定义处 | 链接来源 |
+|---|---|---|
+| `native_verified_block_root_authorized` | `VirtioMmioBlock/NativeVirtioBlock.cpp:317`（`-DNATIVE_VERIFIED_BLOCK=1`） | `build-arm-driver.py NativeVirtioBlock --verified-root --verified-root-bundle` → `build/virtio-mmio-block-verified-bundle/libVirtioMmioBlock.a`，由 `CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE` force_load |
+| `IOMedia::gMetaClass` | **不定义**——IOStorageFamily 是 prelinked kext | `.globl/.set` 绝对地址别名（样板 `scripts/data/native-aes-original-bindings.S`）**追加**进驱动归档 |
+
+`build-virtio-mmio-bindings.py` 只覆盖 `IOBlockStorageDevice` 家族，**不含 `IOMedia`**——
+这就是 `IOMedia::metaClass` 缺失的原因。新工具
+`tools/fill-missing-original-bindings.py` 用 `native_prelink.exports()` 从 prelinked
+内核查地址，把 IOMedia 等缺失绑定补上并 `ar rcs` 追加（不覆盖）。
+
+verified-root bundle 归档（§11.5-1）只是参数问题：`--include-systemos` 才产
+`_verified_root_policies` / `_verified_root_policy_count`，alioth 的
+`CONFIG_XNU_VERIFIED_ROOT_ARCHIVE` 指的就是 `verified-root-os-xnu-bundle/`。
+
+另从 umi（`reAAAq/UniXNU-umi`，同 SM8250，已到 iPadOS 17.7.11 Hello/Setup Assistant）确认：
+**owner-root 必须同时开 `XNU_NATIVE_AES` + `XNU_NATIVE_VIRTIO_BLOCK`**（`build_umi_xnu.py:141`）。
+
+参考源码已按 `components.toml` 固定 revision 拉到 `D:////unixnu////src////ref////`：
+`VirtioMmioBlock@4e1013e`、`VerifiedRoot@974f043`、`RamBlock@93dd9af`、`XnuPrelink`、`umi`。
+
+---

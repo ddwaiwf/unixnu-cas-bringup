@@ -232,6 +232,11 @@ alioth 的 `scripts/` 里有 `find-cache-image.py`、`make-gpu-addon-alioth.sh`�
 
 ## 7. 明天第一件事（可直接执行）
 
+> **2026-11-10 夜更新**：PID 1 已达成，现在卡在 UFS 真根的两个链接符号。
+> 直接看 **`UFS-ROOT-DAY2.md`** —— 三个卡点（verified-root bundle / IOMedia::gMetaClass /
+> native_verified_block_root_authorized）的完整解法、命令顺序、验收方法都在里面。
+> 下面这段是原始计划，仍适用于后续阶段。
+
 ```
 # 1. 看这份清单和参考仓库
 cat D:\unixnu\repo-cas-bringup\PORTING-PLAN.md
