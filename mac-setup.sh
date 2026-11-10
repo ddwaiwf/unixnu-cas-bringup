@@ -72,7 +72,41 @@ done
 for s in build-boot-progress.py build-link-stubs.py; do
   [ -f "$TREE/scripts/$s" ] || echo "    注意: scripts/$s 需要从 alioth 设备仓拷（同 SM8250）"
 done
+# ShengUfs 的绑定脚本不在 UniXNU 框架里，来自 alioth 的 kit（gitlink）
+if [ ! -f "$TREE/scripts/build-storage-bindings.py" ]; then
+  echo "    注意: scripts/build-storage-bindings.py 缺失，board.toml 的 archives 会失败"
+  echo "           从 alioth 设备仓的 kits/ 或已有构建树里拷一份"
+fi
 ok
+
+# --- 5b. 前置条件体检：明确告诉你哪些还没就绪 ---
+step "5b/6 前置条件体检（缺的会列出来，不会静默跳过）"
+cd "$TREE"
+missing=0
+check_dir() {
+  if [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; then
+    echo "    [OK]   $2"
+  else
+    echo "    [缺]  $2  <- $3"
+    missing=$((missing+1))
+  fi
+}
+check_file() {
+  if [ -f "$1" ]; then echo "    [OK]   $2"; else
+    echo "    [缺]  $2  <- $3"; missing=$((missing+1)); fi
+}
+check_dir  build/verified-root-os            "OS 签名策略"        "在 Mac 上跑 build-owner-os-policy.py（需 hdiutil 挂载 044-76040-038.dmg）"
+check_dir  build/verified-root-systemos      "SystemOS 签名策略"  "同上，044-76034-038.dmg"
+check_dir  build/verified-root-host          "host 工具链+密钥"   "README §11.1 说 Mac 已就绪"
+check_dir  build/xnu-prelink                 "prelinked candidate" "构建链产出 native-apfs-load-positive.macho"
+check_dir  build/darwinboot-storage-native-metadata "真机 GDB live metadata" "必须从运行中的内核抓，Windows 侧无法代做"
+check_dir  build/storage-abi                 "存储 ABI 审计"      "跑 audit-storage-interface.py"
+check_file scripts/build-storage-bindings.py "ShengUfs 绑定脚本"  "来自 alioth kit"
+echo
+if [ "$missing" -gt 0 ]; then
+  echo "    还有 $missing 项没就绪。下面仍会尝试构建，但很可能在审计/绑定这步停下。"
+  echo "    这是预期内的：存储绑定的地址要从真机运行时抓，不是纯离线能补的。"
+fi
 
 # --- 6. 开编 ---
 step "6/6 构建 UFS 真根内核"

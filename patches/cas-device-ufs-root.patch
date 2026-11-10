@@ -1,5 +1,5 @@
 diff --git a/board.toml b/board.toml
-index 048deb9..c293167 100644
+index 048deb9..ebb4c3d 100644
 --- a/board.toml
 +++ b/board.toml
 @@ -18,7 +18,7 @@ config_fragments = ["arch:configs/common.config", "soc:configs/sm8250.config", "
@@ -7,7 +7,7 @@ index 048deb9..c293167 100644
  # cas-armcpu-asm-fix.py must run before component:ArmCpu: it stages ArmCpu with the
  # Darwin assembler separator fix that upstream ArmCpu 9066b53 still lacks.
 -archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "cas-armcpu-asm-fix.py", "component:ArmCpu", "component:SoftwareAES", "build-software-aes-bindings.py", "build-mockfs-fixture.py", "build-libpthread-kernel.py"]
-+archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "cas-armcpu-asm-fix.py", "component:ArmCpu", "component:SoftwareAES", "build-software-aes-bindings.py", "component:ShengUfs", "build-virtio-mmio-bindings.py --component NativeUfs --directory build/sheng-ufs", "component:VirtioMmioBlock", "build-virtio-mmio-bindings.py --component NativeVirtioBlock --directory build/virtio-mmio-block", "build-mockfs-fixture.py", "build-libpthread-kernel.py", "build-cas-platform-power.py", "build-boot-progress.py"]
++archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "cas-armcpu-asm-fix.py", "component:ArmCpu", "component:SoftwareAES", "build-software-aes-bindings.py", "component:ShengUfs", "build-storage-bindings.py --component NativeUfs --archive libShengUfs.a --directory build/sheng-ufs", "component:VirtioMmioBlock", "build-virtio-mmio-bindings.py --component NativeVirtioBlock --directory build/virtio-mmio-block", "build-mockfs-fixture.py", "build-libpthread-kernel.py", "build-cas-platform-power.py", "build-boot-progress.py"]
  
  [device_tree]
  source = "device:dts/cas.dts"
