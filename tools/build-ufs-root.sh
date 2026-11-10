@@ -83,6 +83,12 @@ build_bindings() {
       echo "      Falling back to build-virtio-mmio-bindings.py for what it covers."
     }
   fi
+  # IOMedia metaclass: the export table may not carry it, so qualify it from
+  # the component's own data. Idempotent; harmless if already present.
+  if [ -f scripts/audit-iomedia-metaclass.py ]; then
+    python3 scripts/audit-iomedia-metaclass.py || \
+      echo "WARN: IOMedia metaclass qualification skipped (no prelinked candidate?)"
+  fi
   python3 scripts/build-virtio-mmio-bindings.py --component NativeVirtioBlock \
       --directory build/virtio-mmio-block || echo "WARN: virtio bindings step failed"
   # The IOMedia gap: build-virtio-mmio-bindings.py does not cover IOMedia.

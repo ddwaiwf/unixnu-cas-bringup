@@ -1,0 +1,37 @@
+--- a/scripts/audit-storage-interface.py
++++ b/scripts/audit-storage-interface.py
+@@ -201,6 +201,9 @@
+               abstract_complete_destructors_trap=True,
+               live_instance_sizes=dict(IOBlockStorageDevice=0x90, IOService=0x88), live_native_4k=True,
+               compiled_public_class_size=int(class_size[1], 16),
++              iomedias={name: hex(by_name[name]) for name in
++                        ('__ZN6IOMedia10metaClassE', '__ZN6IOMedia10gMetaClassE', '__ZTV6IOMedia')
++                        if name in by_name},
+               methods=[dict(slot=i, reference_name=name, candidate_target=hex(pointers[i]), kernel_names=exports.get(pointers[i], []))
+                        for i, name in enumerate(methods)], disk_read_tested=False, transport_implemented=False, hardware_tested=False)
+ (out / 'interface-audit.json').write_text(json.dumps(result, indent=2) + '\n')
+--- a/scripts/build-virtio-mmio-bindings.py
++++ b/scripts/build-virtio-mmio-bindings.py
+@@ -71,9 +71,19 @@
+                  '__ZN20IOBlockStorageDeviceD2Ev': int(audit['original_base_destructor'], 16),
+                  '__ZN20IOBlockStorageDevice10gMetaClassE': int(audit['original_metaclass'], 16),
+                  '__ZTV20IOBlockStorageDevice': int(audit['vtable'], 16)})
+-undefined = [name for name, value, kind in symbols if kind == 1 and ('IOBlockStorageDevice' in name)]
+-if any(name not in possible for name in undefined):
+-    raise SystemExit('Unqualified original storage import')
++# IOMedia is a separate original class in the same prelinked kext. The driver
++# reaches it through OSDynamicCast(IOMedia, ...) -> OSTypeID -> IOMedia::metaClass,
++# so its metaclass has to be bound as well. This script used to filter undefined
++# symbols on 'IOBlockStorageDevice' only, which left every IOMedia import
++# undefined at kernel link time.
++for name, address in audit.get('iomedias', {}).items():
++    possible[name] = int(address, 16)
++undefined = [name for name, value, kind in symbols
++             if kind == 1 and ('IOBlockStorageDevice' in name or 'IOMedia' in name)]
++missing = [name for name in undefined if name not in possible]
++if missing:
++    raise SystemExit('Unqualified original storage import: ' + ', '.join(missing) +
++                     ' (run scripts/audit-iomedia-metaclass.py to qualify IOMedia)')
+ # Abstract D1/D0 are BRK traps. Only actual base D2 is appropriate for this subclass.
+ if any(re.search(r'IOBlockStorageDeviceD[01]Ev$', n) for n in undefined):
+     raise SystemExit('Concrete driver must not invoke abstract complete/deleting destruction')
