@@ -814,4 +814,50 @@ OS/SystemOS 窗口）→ 真实 iOS 根 + 真 launchd → legacy display/GPU →
 
 ---
 
-*本文档由实际调试过程整理，所有命令均在 Windows 11 + WSL2 Ubuntu 24.04 上验证过。*
+## 11. 2026-11-10 晚：UFS 真根第一日——真机 PID 1 确认、三层根因与 userdata 刷写
+
+### 11.1 成果一览
+
+| 里程碑 | 状态 |
+|---|---|
+| boot-progress 仪器版（v7）确认真机 **PID 1**：`process signature accepted` → `load_init_program` → `1 launchd` → `process exit: total=2 nonzero=0` | ✅ |
+| UFS 组件链四件套接入（feeds / board.toml / defconfig / cas.dts） | ✅（但见 11.3——驱动当晚才真正进内核） |
+| `userdata-root.img` 构建并刷入真机（SHNGROOT 布局，OS+SystemOS 窗口哈希与 policy 闭环） | ✅ |
+| verified-root host 工具链（openssl@3 + RSA3072 owner 密钥 + verified-root.dylib） | ✅ |
+| 两个 donor 卷 dmg 下载并字节级验证（76040 OS / 76034 SystemOS，sha 与脚本硬编码期望一致） | ✅ |
+| 完整 IPSW（6.9 GB）断点续传落盘 | ✅ |
+
+### 11.2 umi→cas 移植路线（社区调研）
+
+`reAAAq/UniXNU-umi`（小米 10，同 SM8250、同 iPad7,1-21H461 donor）已跑到 **iPadOS 17.7.11 Hello/Setup Assistant**（attempt 80）：UFS root + persistent Data + CPU 显示（ABL scanout）+ ST FTS 触摸全部工作。cas 的到桌面路线定型为**搬 umi/alioth 的组件**（调参级，非写驱动级）。UFS 驱动本体 = 公开仓 `UniXNU/ShengUfs` 的 SM8250 fork `FFT-infra/NativeUfs-alioth`（按 `qcom,sm8250-ufshc` compatible 扫 DT 匹配，takeover 依赖 ABL 留下的活控制器，轮询不占中断）。
+
+### 11.3 💣 三层根因：UFS 驱动从未进过任何 cas 内核
+
+v9/v10 两轮上机面板全零（`published=0 probe=0 match=0`）+ `Failed to mount root device @IOKitBSDInit.cpp:984`。逐层排查揪出三个叠加缺陷，**每个都足以单独让驱动静默消失**：
+
+1. **defconfig 解析器 last-wins**：`# CONFIG_X is not set` 行是**活的**（框架 config.py 把它解析成 False）。旧默认关的 not-set 标记残留在新加的 `=y` 行**后面**，每次解析把 `XNU_NATIVE_UFS` / `XNU_NATIVE_VIRTIO_BLOCK` 覆盖回 0 → baseline 的 force_load 块从未带上 UFS。**教训：`is not set` 标记绝不能与同名 `=y` 共存，且必须写在它前面。**
+2. **storage-bindings 覆盖驱动归档**：`component:ShengUfs` 产出含 `NativeUfs.o`（605 KB）的 `libShengUfs.a` 后，bindings 脚本用 `shutil.copyfile(bindings归档, target)` 把它覆盖成 2.7 KB 纯绑定壳。修复：target 已存在时改用 `ar rcs target original-bindings.o` **追加**绑定对象，不覆盖。
+3. **boot-progress 桩与驱动真符号冲突**：桩生成器 nm 只扫 boot-progress 对象；驱动真正链接后会撞重复定义。修复：nm 追加扫描 `build/sheng-ufs/libShengUfs.a` + `build/virtio-mmio-block/libVirtioMmioBlock.a`，驱动已提供的符号不再生成桩。
+
+验证手段（值得抄走）：`llvm-nm kernel.macho | grep native_ufs` —— **桩定义在 .bss（`S`），驱动的初始化定义在 data（`D`）**；看见 `S` 就是桩在撒谎。再配 `strings kernel.macho | grep 'NativeUfs:'` 确认驱动代码真的在内。
+
+另：baseline 整个 force_load 块的守卫是 `XNU_SOURCE_CORECRYPTO14=1 && BOOTSTRAP=0`，UFS/boot-progress/verified-root 的归档全在里面——defconfig 缺 CORECRYPTO14 时这些开关全都静默失效。
+
+### 11.4 fastboot 大文件刷写坑（8.7 GB userdata）
+
+| 现象 | 根因 | 对策 |
+|---|---|---|
+| `flash userdata` >2.3 GB 即静默失败（600 MB/1.5 GB 正常） | fastboot 37 host 端自动 sparse 转换在大文件上溢出 | 自写**分段 sparse**：14 段、每段 ~664 MB raw（`0xCAC1`）+ 前段 FILL(0)（`0xCAC2`+4 字节 0 填充值，**不是** `0xCAC3` dont-care——dont-care 留 unmapped 块，UFS 读会报错） |
+| 奇偶交替 `Last flash failed: Volume Corrupt` | 小米 bootloader 在两次 flash 间检查 f2fs 卷状态，raw 数据破坏卷头即拒绝 | 状态机规律 = 成功→失败→成功；**每段重试至多 2 次必成**（失败那次数据未写入，不损坏分区） |
+
+userdata 镜像由框架原生 `./unixnu userdata` 一步构建（SHNGROOT：OS 窗口 6,077,580,800 B @ LBA 0x100000 + SystemOS 3,303,014,400 B @ 0x16a600000），[userdata] 窗口大小要 ≥ 镜像 8.74 GiB（原分区尾会产生 240 GB 稀疏文件）。
+
+### 11.5 下一步（原料全部就绪）
+
+1. **verified-root bundle 归档**：OS-only 模式的 probe 归档不含 `_verified_root_policies/_verified_root_policy_count`（只在 `--include-systemos` bundle 分支生成）。两份 policy（os 1,483,785 块 / systemos 806,400 块）已验证，跑 `build-verified-root-probe.py --component os --include-systemos` 换 bundle 归档即可。
+2. 补齐 `IOMedia::metaClass`（IOStorageFamily 侧）与 `_native_verified_block_root_authorized`（offline-owner 组件侧）的链接来源。
+3. 内核带驱动重编 → `fastboot boot` → UFS 真根 verified-block 逐块验证 → 发布 `ufsroot0` → 真 launchd（OS trust cache 打包：static-trustcache.bin 已解出，sha 与框架期望一致）。
+
+---
+
+*§11 由 2026-11-10 晚 Mac 实机调试整理；fastboot 分段 sparse 生成器与设备状态机结论在小米 10 Ultra（cas）上实测有效。*
