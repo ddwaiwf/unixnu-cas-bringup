@@ -993,3 +993,71 @@ iPhoneOS16.5.sdk + cctools + lld wrapper），是数小时级工程。
 
 ---
 
+## 14. 真 UFS 根 → 原始 launchd 在 EL0 启动（2026-11-11）
+
+### 14.1 终点状态
+
+v29（`cas-mac-v29-union.img`，内核 `d6c941e5…`）真机屏幕：
+
+```
+mount[3] exited
+EL0 breakpoint record unavailable -- no exit reason available
+   -- (signal 0, exit status 66)
+```
+
+这不是新故障。UniXNU 的 `scripts/check-original-launchd-main-checkpoints.py` 对它的判定是：
+
+```python
+require(... == b'mount[3] exited' and args[1] == 0 and args[2] == 66,
+        'Actual mount child exits 66 normally; do not mislabel this as an initproc code-sign kill')
+print('PASS: unchanged original Sandbox policy is active; unchanged original launchd starts LC_MAIN at native-4K EL0')
+```
+
+即：**未经修改的 Apple launchd 已在 native-4K EL0 用户态启动，并派生出第一个子进程 `mount`(PID 3)**；该子进程以 66 正常退出，内核按"关键进程退出"panic。这也是 UniXNU QEMU 验证链自己停下的位置（报告里 `functional_ipados_booted=False`），不是 cas 引入的缺陷。
+
+### 14.2 打通的六层
+
+| 层 | 关键动作 | 证据 |
+|---|---|---|
+| 1 盘上数据 | `scripts/cas-sparse-region.py` 生成 **DONT_CARE 前缀**区段稀疏镜像，只重写指定区间；OS 三段 + SystemOS 一段 | 探针逐块 SHA：`OS 9952a041…`、`SystemOS 55780285…` == 签名值；`same=1` |
+| 2 UFS 驱动 | bounce 缓冲从 `kMediaBlockBytes`(4096) 改为 `kDataMax`(131072)；两窗口发布 | `published=2`，卷 UUID 均 ready |
+| 3 根设备选择 | `board.toml [payload.adt] root_match_volume_uuid = "04769D26-…"` → `/chosen/root-matching` | 不再 `Failed to mount root device` |
+| 4 根认证 / AMFI | 每次 `build payload` 必带 `--trust-cache assets/static-trustcache.bin`（sha `7416ca4f…`） | 从 `EXEC/SECURITY_POLICY`(ns 9 code 8) 变为 dyld 阶段 |
+| 5 dyld / cryptex | 框架 `offline-owner-systemos-mount.patch` + `XNU_OWNER_CACHE_MOUNT=1`、`_STARTUP=1`、`_UNION_SYSTEMOS=1`（`_CRYPTEX_FILES=0`） | 不再 `no dyld cache` |
+| 6 用户态 | SystemOS 卷以 `MNT_UNION` 叠到 `/`，dyld 按默认路径加载 | `mount[3] exited` |
+
+### 14.3 踩过的坑（按出现顺序）
+
+1. `result=e00002c1` 是 `verify()` 对 `VR_BLOCK` 的返回值，**不是读失败**；`failure=5` = 块哈希不符。
+2. `NativeUfsBlock::configure()` 的 bounce 只按 4096 分配，而 `ufsReadWindow` 单次读 131072 → 溢出 124 KB。
+3. 带 `FILL(0)` 前导的分段 sparse 必须**降序刷**；换成 `0xCAC3` DONT_CARE 前缀才能只重写一段而不碰区间外。
+4. defconfig 里 `# CONFIG_X is not set` 是**活行**且后写覆盖 `=y`。
+5. `./unixnu build payload` 不带 `--trust-cache` 会静默产出 `trust_cache_sha256: null`，AMFI 在 exec 时拒绝 launchd（`namespace 9 / code 8`）。trust cache 可从旧 payload FAT 里取回。
+6. `root-matching` 必须写在 `[payload.adt]`：`devicetree.py generate()` 从零重建 `/chosen`，改 DTS 无效；不给它 `IOFindBSDRoot` 会兜底等 `Apple_HFS` 然后 panic。
+7. `probe=16` 全量逐块校验在 probe 模式会被 bsd_init 的 root wait **抢先 panic**（不发布 IOMedia）；生产路径本来就是读时逐块校验。
+8. 非 union 分支靠注入 `DYLD_SHARED_CACHE_DIR` / `DYLD_FALLBACK_LIBRARY_PATH`，但 launchd 是 platform binary，dyld 忽略 `DYLD_*` → 必须用 union。
+9. 每次 tree 重刷会清空 `.cache/xnu-work`，`prepare-xnu-source.py` 重下 26 个 XNU 头文件；已给 `fetch()` 加夜煞云代理 curl 兜底。
+10. 提取 bootimg ramdisk 的正确字段是 `f[0]/f[2]/f[7]`（kernel_size / ramdisk_size / page），`f[8]` 是 header_version=2，不是页大小。
+
+### 14.4 可复现构建
+
+```bash
+cd UniXNU
+env -u PYTHONPATH UNIXNU_UEFI=<uefi-cas> \
+  XNU_OWNER_CACHE_MOUNT=1 XNU_OWNER_CACHE_STARTUP=1 \
+  XNU_OWNER_CRYPTEX_FILES=0 XNU_OWNER_UNION_SYSTEMOS=1 \
+  ./unixnu build kernel payload -D ../UniXNU-cas \
+  --trust-cache ../UniXNU-cas/assets/static-trustcache.bin
+cd ..
+python3 pack-cas-bootimg-mac.py --uefi uefi-cas \
+  --fd uefi-cas/Build/casUpstream001/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd \
+  --payload UniXNU/out/cas/ipados-17.7.11-21H461/cas/payload/payload.img \
+  --stock-dtb ~/Desktop/boot-dtb-initrd.bin --out UniXNU/out/cas-mac-v29-union.img
+fastboot boot UniXNU/out/cas-mac-v29-union.img
+```
+
+### 14.5 边界与下一步
+
+`functional_ipados_booted=False`：真 launchd 起来了，但完整桌面/服务尚未跑通（`mount[3]` 退出 66 即停）。下一层是 Data 卷与根卷封存：UniXNU 的 `XNU_OWNER_DATA_MOUNT` / `prepare-owner-data-fixture.py` 与 `XNU_OWNER_BOOT_MANIFEST` 提供 scratch Data volume 和 boot manifest，可继续借用现成件。
+
+---
