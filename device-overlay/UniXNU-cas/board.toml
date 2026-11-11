@@ -1,0 +1,78 @@
+schema_version = 2
+
+[board]
+name = "cas"
+arch = "AARCH64"
+kit = "cas"
+soc = "SM8250"
+soc_source = "sm8250"
+os_profile = "ipados-17.7.11-21H461"
+description = "Xiaomi 10 Ultra (cas): iPadOS 17.7.11 on UniXNU"
+
+[components]
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot", "ShengUfs", "VirtioMmioBlock"]
+
+[kernel]
+defconfig = "cas_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/sm8250.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+# cas-armcpu-asm-fix.py must run before component:ArmCpu: it stages ArmCpu with the
+# Darwin assembler separator fix that upstream ArmCpu 9066b53 still lacks.
+archives = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "cas-armcpu-asm-fix.py", "component:ArmCpu", "component:SoftwareAES", "build-software-aes-bindings.py", "cas-ufs-iomedia-free.py", "cas-ufs-panel-diag.py", "cas-ufs-bounce-fix.py", "cas-ufs-window-hash-probe.py", "cas-ufs-verify-all-probe.py", "component:ShengUfs", "build-storage-bindings.py --component NativeUfs --archive libShengUfs.a --directory build/sheng-ufs", "component:VirtioMmioBlock", "build-storage-bindings.py --component NativeVirtioBlock --archive libVirtioMmioBlock.a --directory build/virtio-mmio-block", "build-mockfs-fixture.py", "build-cas-platform-power.py", "build-boot-progress.py", "build-libpthread-kernel.py"]
+
+[device_tree]
+source = "device:dts/cas.dts"
+include_dirs = ["soc:dts"]
+preserve_memory_ranges = true
+export_arch_timer = true
+
+[firmware]
+config = "cas"
+dsc = "casPkg/cas-upstream.dsc"
+fd = "Build/casUpstream001/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+defines = { CAS_BUILD_DIR = "Build/casUpstream001" }
+packages = ["{uefi}/Platforms/Xiaomi", "{uefi}/Common/Mu", "{uefi}/Common/Mu_OEM_Sample", "{uefi}/Mu_Basecore", "{uefi}/Silicon/Qualcomm", "{uefi}/Silicon/Silicium", "{tree}/package", "{tree}/drivers/DarwinBoot", "{edk2}"]
+
+# userdata on LUN0 (sda34), measured from the cas GPT; it holds the iOS root image.
+# last_lba is narrowed from the partition end (0x3b4b7fa, ~240 GiB) to cover just the
+# SHNGROOT manifest plus the OS and SystemOS windows (~8.7 GiB): the driver reads the
+# manifest at the partition start and the windows behind it, and the image only has to
+# span what the driver reads. MIUI data beyond the image is untouched by the write.
+[userdata]
+first_lba = 0x2c0000
+last_lba = 0x4f0000
+lba_bytes = 4096
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+[payload]
+volume = "CAS_IOS17"
+# 2026-11-11: the UFS driver plus the real verified-root policy bundle (OS manifest
+# 47 MiB + SystemOS manifest 3 MiB, incbin'd into libVerifiedRootProbe.a) took the
+# kernel from 52 MiB to 120 MiB. The old 64 MiB volume silently aborted every payload
+# rebuild ("the payload files take 119 MiB; raise size_mib"), so v11 booted a stale
+# kernel. Keep at least 1.35x the expected kernel size.
+size_mib = 160
+loader = "firmware"
+title = "cas iPadOS 17"
+timeout = 3
+panic_screen = true
+kernel_args = ["-v", "keepsyms=1", "debug=0x14e", "kt_fixed_zones=120", "sheng-pmgr=2", "native-ufs-stream=0xe0", "native-ufs-stream2=0x4e0", "native-ufs-root=1", "native-ufs-diagnostics=1", "boot-progress=2"]
+
+[payload.adt]
+chip_id = "8011"
+owned_memory_size = "0x130000000"
+cpu_regs = "0"
+psci_method = "smc"
+unique_chip_id = "required"
+# Root selection. IOFindBSDRoot() reads /chosen/root-matching as an unserialized IOKit
+# matching dictionary; without it, it falls back to "any Apple_HFS IOMedia" and iOS panics
+# with "Failed to mount root device" after ten waits. Point it at the OS window's APFS
+# volume UUID: the value the OS window's verified-root policy is signed against, and the
+# media the driver already waits for after publishing (the stock iPadOS selector).
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+
+[adt.root.string]
+hardware-model = "Qualcomm Technologies, Inc. xiaomi cas"

@@ -1,0 +1,43 @@
+# Single-core continuous bring-up. New successful observations never stop execution.
+CONFIG_XNU_BUILD_ARCHIVES=y
+CONFIG_XNU_SOURCE_CORECRYPTO14=y
+CONFIG_XNU_SOURCE_PTHREAD=y
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_AES=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_DT_PANIC_REGION=y
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+CONFIG_XNU_SOURCE_MOCKFS=y
+CONFIG_XNU_TRUST_CACHE_RUNTIME=y
+# cas bringup (cas-bringup §3.14): guarded original-PMGR bridge, fixes "AMFI: No PMGR?" panic.
+CONFIG_XNU_SHENG_PMGR=y
+# UFS host (ShengUfs/NativeUfs-alioth, SM8250 streams 0xe0/0x4e0). Root switch (2026-11-10
+# round 2): VERIFIED_ROOT_PROBE publishes the IOMedia from the userdata OS window; the probe
+# archive is the real signed hash table over the unchanged 21H461 OS image (1483785 blocks
+# verified host-side, scripts/build-owner-os-policy.py). OWNER_ROOT_AUDIT/TRUST answer
+# FSIOC_KERNEL_ROOTAUTH without Apple SEP; VIRTIO_BLOCK is selected only as the read-only
+# authentication library alioth uses (its transport never probes on this board).
+CONFIG_XNU_NATIVE_UFS=y
+CONFIG_XNU_VERIFIED_ROOT_PROBE=y
+# The kernel links exactly these archives (baseline force_load):
+#  - verified-root must come from the --include-systemos bundle: only that branch emits
+#    _verified_root_policies / _verified_root_policy_count (OS-only leaves them undefined).
+#  - virtio must come from the --verified-root --verified-root-bundle build: it defines
+#    native_verified_block_root_authorized(dev_t), which bsd_init's OWNER_ROOT_AUDIT hook calls.
+CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a"
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/virtio-mmio-block-verified-bundle/libVirtioMmioBlock.a"
+CONFIG_XNU_OWNER_ROOT_AUDIT=y
+CONFIG_XNU_OWNER_ROOT_TRUST=y
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
+# 2026-11-10 20:35 lesson: "# CONFIG_X is not set" lines are LIVE in the parser and the
+# last occurrence wins, so they must never trail a =y for the same symbol. The stale
+# not-set markers for NATIVE_UFS / NATIVE_VIRTIO_BLOCK silently disabled the UFS host
+# in every cas kernel to date (the driver archive was force-loaded never, the panel
+# counters were the boot-progress zero stubs).
+# CONFIG_XNU_NATIVE_ADRENO is not set
+# CONFIG_XNU_NATIVE_RAM_BLOCK_STORE is not set
+
+# Successful observations log and continue; boot-progress marks drawn to the framebuffer for hang localization.
+CONFIG_XNU_BOOT_PROGRESS=y
