@@ -858,6 +858,34 @@ userdata 镜像由框架原生 `./unixnu userdata` 一步构建（SHNGROOT：OS 
 2. 补齐 `IOMedia::metaClass`（IOStorageFamily 侧）与 `_native_verified_block_root_authorized`（offline-owner 组件侧）的链接来源。
 3. 内核带驱动重编 → `fastboot boot` → UFS 真根 verified-block 逐块验证 → 发布 `ufsroot0` → 真 launchd（OS trust cache 打包：static-trustcache.bin 已解出，sha 与框架期望一致）。
 
+### 11.6 驱动首次进链后的四个链接符号（当前坐标）
+
+修完 11.3 的三层根因后，`libShengUfs.a` 首次以 612 KB（`NativeUfs.o` + `original-bindings.o`）被 force_load，
+链接器立刻点名四个符号——不是坏消息，而是「驱动终于进来了」的证据：
+
+```
+Undefined symbols for architecture arm64:
+  "IOMedia::metaClass", referenced from:
+      renameWholeUserdataThread(void*, int) in libShengUfs.a[2](NativeUfs.o)
+  "_native_verified_block_root_authorized", referenced from:
+      _bsd_init in bsd_init.o
+  "_verified_root_policies", referenced from:
+      NativeUfsBlock::configureVerification() in libShengUfs.a[2](NativeUfs.o)
+  "_verified_root_policy_count", referenced from:
+      NativeUfsBlock::configureVerification() in libShengUfs.a[2](NativeUfs.o)
+```
+
+| 符号 | 归属 | 取法 |
+|---|---|---|
+| `_verified_root_policies` / `_verified_root_policy_count` | `build-verified-root-probe.py` 的 **bundle 分支**（`--include-systemos`）才 emit；OS-only 只出 manifest/samples | 重跑：`--component os --include-systemos` → `build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a` |
+| `IOMedia::metaClass` | IOStorageFamily（`ufsroot0` BSD 命名路径） | 见 11.6 下方说明 |
+| `_native_verified_block_root_authorized` | offline-owner 补丁只 `extern` 声明，定义在 verified-block 驱动侧 | 同 UFS 组件的 verified-block 模式产物 |
+
+`_native_verified_block_root_authorized(dev_t)` 的签名（来自 `patches/xnu/offline-owner-*.patch` 的 extern 声明）：
+它由驱动侧在 `configureVerification()` 通过后提供，语义是「这个 dev_t 的根卷已通过实时块验证」。
+cas 侧要么由 UFS 组件的 verified-block 构建产出定义，要么由 verified-root bundle 归档一并提供——
+这是 11.6 之后第一个要落实的点。
+
 ---
 
 *§11 由 2026-11-10 晚 Mac 实机调试整理；fastboot 分段 sparse 生成器与设备状态机结论在小米 10 Ultra（cas）上实测有效。*
