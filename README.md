@@ -918,3 +918,78 @@ verified-root bundle 归档（§11.5-1）只是参数问题：`--include-systemo
 `VirtioMmioBlock@4e1013e`、`VerifiedRoot@974f043`、`RamBlock@93dd9af`、`XnuPrelink`、`umi`。
 
 ---
+
+## 13. 2026-11-11：改走 hackios 成品线——iOS 16.5 内核在全套真实驱动下跑起来
+
+UniXNU 线卡在 SHNGROOT manifest 一处（驱动已跑通 GPT 读取，manifest 校验被拒）。为了
+不再逐个打内核补丁，转向同款机器（cas）已有完整移植的 `DBC1349/hackios-mi10ultra`
+（iOS 16.5 用户态已到 SpringBoard），直接用它发布的成品包。
+
+### 13.1 关键结论：那个 Windows daemon 不是 Windows 专有的
+
+release 里的 `scripts/windows/winfbd3.ps1` + `WU2.cs` 看起来是 WinUSB 专用，
+实际上协议极简，macOS 用 pyusb 一百多行就能完整替代：
+
+| 项目 | 值 |
+|---|---|
+| USB 设备 | `18d1:d00d`，接口名 `xnuloader`，class `0xff` / subclass `0x42` / protocol `0x03` |
+| 端点 | bulk `0x01` OUT / `0x81` IN，max packet 512 |
+| 命令 | 裸 ASCII 字符串，一条命令一个短回复 |
+| 载入镜像 | `download:<长度，8 位十六进制>` → 回 `DATA<长度>` → 流式写原始字节 → 回 `OKAY` |
+| 其他 | `oem ramdisk` / `oem ramdisk none`、`oem run`、`getvar:result`、`oem log`、`oem stop`、`reboot` |
+| 取回文件 | `oem log`（或 `oem screenshot`）→ `upload` → 回 `DATA<长度>` → 读该长度字节 |
+
+macOS 实现见本仓库 `tools/boot_hackios.py`，一键脚本 `tools/run_hackios.sh`。
+
+### 13.2 四个必踩的坑（按发现顺序，全部实测）
+
+1. **必须 `claim_interface`**：libusb 在 macOS 上不认领接口，bulk 写会一直超时。
+   WinUSB 因为直接打开设备接口，所以 Windows 脚本里根本没有对应步骤——这是
+   移植时最容易漏掉的一步。
+2. **载入镜像用 `download:<hex>`，不是 `upload`**：`upload` 是反方向（把日志/截图
+   从设备读出来）。用错时 loader 会回它自己的缓冲大小（我们当时收到 210 字节），
+   然后一直等数据、不再读命令。
+3. **握手要重试**：loader 枚举出来之后还要几秒命令循环才就绪，此前写入得到
+   `USBError: Other error`。改成 2 秒超时、40 秒内重试即可。
+4. **结果查询是 `getvar:result`**（带冒号）；`getvar result` 返回 `FAILunknown command`。
+   返回值语义：`OKAYrunning 0 0` = 内核正在跑；`OKAYreturned <code> 0` = 内核跑过并退出。
+
+另外：loader 卡在 download 模式时**不必冷启动**，新进程续传即可；但如果上次已有
+部分字节写入，会得到 `FAILshort download`，此时从 `oem ramdisk` 重新走完整流程
+（同一个 loader 实例可复用）。
+
+### 13.3 实测结果
+
+**stable payload（`run-payload-cas-stable.bin` + `cas-ufs2.img` + `root.apfs`）——
+全套真实驱动初始化成功**，内核运行 18 秒后正常返回，日志逐条为证：
+
+| 子系统 | 日志 |
+|---|---|
+| Wi-Fi（QCA6390） | `UMI Wi-Fi: station ready for iOS Wi-Fi requests`，射频启动、station 模式接口添加成功 |
+| 音频（ADSP / MI2S2） | `sound: THE AUDIO CLOCK AND FRAME SYNC RUN at the pins`、SMMU context 7、DSP 的 ADM/ASM 配置完成 |
+| 电池（BQ28Z610） | `battery: BQ28Z610 SOC=99% V=8806 mV I=0 mA T=28.0 C` |
+| 触摸（FTS） | `UMI FTS: poll=625 events=7 errors=0 irq=1` |
+| 蓝牙 | `UMI BT: TLV type=1 accepted: 188564 bytes, 776 segments` |
+| UFS | `ufs: 0 writes into darwin, 0 bytes, read back the same; 0 refused` |
+
+**GPU payload（`run-payload-gpu-wifi.bin`）卡在 adreno step 20**（配置本身到 step 21）：
+大量 `adreno: 20: about to write ...` 寄存器写之后停住，`getvar:result` 回
+`OKAYreturned 104011 0`。这正是 hackios README 踩坑记录里写明的问题——自建 loader
+缺少 umi 新 loader 的“归还 GPU”复位逻辑，官方给出的解法是改用 `cas-umiloader.img`
+或冷启动后首轮 bring-up。
+
+### 13.4 loader 兼容性（实测，与 release note 一致）
+
+| img | 结果 |
+|---|---|
+| `cas-ufs2.img`（2026-10-29） | **可用**，唯一带 `TzDxeLA` 补丁的 loader |
+| `cas-touch2.img` | boot 后 UEFI 约 2 秒从 USB 消失（`Errno 19`） |
+| `cas-umiloader.img` | 同上，也是未打补丁的 UEFI |
+
+两个 img 都是 Android boot image（`ANDROID!`，page 2048），UEFI 段被压缩，
+仓库里没有 `patches/patch_tz.py`（作者未提交），因此无法直接做字节级补丁。
+要让 umi loader 在 cas 上跑起来，需要按 README §5 重建 UEFI（theos +
+iPhoneOS16.5.sdk + cctools + lld wrapper），是数小时级工程。
+
+---
+
